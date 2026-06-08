@@ -1,12 +1,24 @@
-"""RSS and scoring configuration for the AI Industry Daily generator.
+"""RSS source and scoring configuration for the AI Industry Daily generator.
 
-Edit this file when you want to add/remove sources or adjust scoring keywords.
-The generator uses Google News RSS plus a small set of AI/tech RSS feeds.
+This module is intentionally lightweight and dependency-free so it can run in
+GitHub Actions without installing packages. Edit this file when you want to add
+or remove news sources, or tune ranking keywords.
 """
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from urllib.parse import quote_plus
+
+
+@dataclass(frozen=True)
+class Feed:
+    """A single RSS/Atom feed definition."""
+
+    name: str
+    url: str
+    weight: float = 1.0
 
 
 GOOGLE_NEWS_LOCALES = [
@@ -31,50 +43,61 @@ def google_news_rss_url(query: str, hl: str, gl: str, ceid: str) -> str:
     )
 
 
-GOOGLE_NEWS_FEEDS = [
-    google_news_rss_url(query, hl, gl, ceid)
+GOOGLE_NEWS_FEEDS: list[Feed] = [
+    Feed(
+        name=f"Google News: {query[:48]}",
+        url=google_news_rss_url(query, hl, gl, ceid),
+        weight=2.0,
+    )
     for query in GOOGLE_NEWS_QUERIES
     for hl, gl, ceid in GOOGLE_NEWS_LOCALES
 ]
 
-# These feeds are intentionally best-effort. If one feed breaks, the generator
-# logs a warning and continues with the rest.
-DIRECT_RSS_FEEDS = [
-    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-    "https://techcrunch.com/category/artificial-intelligence/feed/",
-    "https://venturebeat.com/category/ai/feed/",
-    "https://www.artificialintelligence-news.com/feed/",
-    "https://blogs.nvidia.com/blog/category/ai/feed/",
-    "https://www.microsoft.com/en-us/ai/blog/feed/",
-    "https://openai.com/news/rss.xml",
+# These direct feeds are best-effort. If one breaks, generate_daily_report.py
+# logs a warning and continues with the others.
+DIRECT_RSS_FEEDS: list[Feed] = [
+    Feed("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", 2.4),
+    Feed("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/", 2.3),
+    Feed("VentureBeat AI", "https://venturebeat.com/category/ai/feed/", 2.0),
+    Feed("Artificial Intelligence News", "https://www.artificialintelligence-news.com/feed/", 1.7),
+    Feed("NVIDIA Blog", "https://blogs.nvidia.com/blog/category/ai/feed/", 1.8),
+    Feed("Microsoft AI Blog", "https://www.microsoft.com/en-us/ai/blog/feed/", 1.8),
+    Feed("OpenAI News", "https://openai.com/news/rss.xml", 1.9),
 ]
 
-RSS_FEEDS = GOOGLE_NEWS_FEEDS + DIRECT_RSS_FEEDS
+# The generator imports DEFAULT_FEEDS directly.
+DEFAULT_FEEDS: list[Feed] = GOOGLE_NEWS_FEEDS + DIRECT_RSS_FEEDS
 
-# Source weights are deliberately modest. Recency and content relevance still matter.
-SOURCE_WEIGHTS = {
-    "Reuters": 18,
-    "Associated Press": 16,
-    "AP News": 16,
-    "Bloomberg": 16,
-    "Wall Street Journal": 16,
-    "Financial Times": 16,
-    "The Information": 14,
-    "The Verge": 13,
-    "TechCrunch": 13,
-    "MIT Technology Review": 13,
-    "CNBC": 12,
-    "Wired": 12,
-    "Business Insider": 10,
-    "VentureBeat": 9,
-    "NVIDIA Blog": 8,
-    "OpenAI": 8,
-    "Google Blog": 8,
-    "Microsoft": 8,
+# Optional aliases kept for compatibility / easier debugging.
+RSS_FEEDS: list[str] = [feed.url for feed in DEFAULT_FEEDS]
+
+# Source weights are deliberately modest. Recency, keyword relevance, and
+# multi-source mentions still matter.
+SOURCE_WEIGHTS: dict[str, float] = {
+    "reuters": 18,
+    "associated press": 16,
+    "ap news": 16,
+    "bloomberg": 16,
+    "wall street journal": 16,
+    "wsj": 16,
+    "financial times": 16,
+    "the information": 14,
+    "the verge": 13,
+    "techcrunch": 13,
+    "mit technology review": 13,
+    "cnbc": 12,
+    "wired": 12,
+    "business insider": 10,
+    "venturebeat": 9,
+    "nvidia": 8,
+    "openai": 8,
+    "google": 8,
+    "deepmind": 8,
+    "microsoft": 8,
 }
 
-KEYWORD_WEIGHTS = {
-    # companies / labs
+KEYWORD_WEIGHTS: dict[str, float] = {
+    # Companies / labs
     "openai": 12,
     "anthropic": 12,
     "google": 9,
@@ -98,7 +121,7 @@ KEYWORD_WEIGHTS = {
     "阿里": 6,
     "腾讯": 6,
     "百度": 6,
-    # themes
+    # Themes
     "ai agent": 10,
     "agents": 8,
     "agentic": 8,
@@ -141,7 +164,8 @@ KEYWORD_WEIGHTS = {
     "融资": 6,
 }
 
-# Avoid entertainment gossip and non-industry fluff unless it has obvious legal/labor/platform implications.
+# Avoid entertainment gossip and non-industry fluff unless it has obvious
+# legal/labor/platform implications.
 NEGATIVE_KEYWORDS = [
     "celebrity",
     "gossip",
@@ -171,3 +195,51 @@ REQUIRED_AI_HINTS = [
     "大模型",
     "智能体",
 ]
+
+TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
+
+
+def normalize_text(value: str | None) -> str:
+    return (value or "").casefold()
+
+
+def tokenize(text: str) -> set[str]:
+    """Tokenize English words/numbers and Chinese character runs for deduping."""
+
+    return {token.casefold() for token in TOKEN_RE.findall(text or "") if len(token) >= 2}
+
+
+def has_excluded_topic(text: str) -> bool:
+    """Return True if a story should be excluded before scoring."""
+
+    lowered = normalize_text(text)
+    if not lowered.strip():
+        return True
+    if any(keyword.casefold() in lowered for keyword in NEGATIVE_KEYWORDS):
+        return True
+    # Keep the candidate pool AI-focused. Google News can occasionally return
+    # stories where "AI" appears in unrelated names or low-signal contexts.
+    if not any(hint.casefold() in lowered for hint in REQUIRED_AI_HINTS):
+        return True
+    return False
+
+
+def source_weight(source: str) -> float:
+    """Return extra ranking weight for trusted/high-signal publishers."""
+
+    lowered = normalize_text(source)
+    for name, weight in SOURCE_WEIGHTS.items():
+        if name in lowered:
+            return float(weight)
+    return 0.0
+
+
+def keyword_score(text: str) -> float:
+    """Return weighted keyword score for AI-industry relevance."""
+
+    lowered = normalize_text(text)
+    total = 0.0
+    for keyword, weight in KEYWORD_WEIGHTS.items():
+        if keyword.casefold() in lowered:
+            total += float(weight)
+    return total
